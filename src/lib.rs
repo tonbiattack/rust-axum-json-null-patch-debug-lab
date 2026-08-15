@@ -1,12 +1,7 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::get,
-    Json, Router,
-};
-use serde::{Deserialize, Serialize};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::RwLock;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -37,7 +32,15 @@ impl AppState {
 
 #[derive(Debug, Deserialize)]
 struct UpdateProfileRequest {
-    nickname: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    nickname: Option<Option<String>>,
+}
+
+fn deserialize_present_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 pub fn app(state: AppState) -> Router {
@@ -57,8 +60,10 @@ async fn update_profile(
     eprintln!("[api] deserialized nickname={:?}", request.nickname);
 
     let mut profile = state.profile.write().await;
-    if let Some(nickname) = request.nickname {
-        profile.nickname = Some(nickname);
+    match request.nickname {
+        Some(Some(nickname)) => profile.nickname = Some(nickname),
+        Some(None) => profile.nickname = None,
+        None => {}
     }
 
     eprintln!("[api] persisted nickname={:?}", profile.nickname);
@@ -69,8 +74,8 @@ async fn update_profile(
 mod tests {
     use super::*;
     use axum::{
-        body::{to_bytes, Body},
-        http::{header::CONTENT_TYPE, Request},
+        body::{Body, to_bytes},
+        http::{Request, header::CONTENT_TYPE},
     };
     use tower::ServiceExt;
 
@@ -98,7 +103,8 @@ mod tests {
     #[tokio::test]
     async fn null_nickname_must_clear_the_persisted_value() {
         let state = AppState::seeded();
-        let (status, response_profile) = patch_profile(app(state.clone()), r#"{"nickname":null}"#).await;
+        let (status, response_profile) =
+            patch_profile(app(state.clone()), r#"{"nickname":null}"#).await;
         let persisted_profile = state.current_profile().await;
 
         assert!(
