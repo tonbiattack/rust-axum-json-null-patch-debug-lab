@@ -1,56 +1,79 @@
 # デバッグ記録: PATCHのnullと未指定を区別する
 
-## 契約
+## 実行環境と再現境界
 
-`PATCH /profile`へ`{"nickname":null}`を送った場合、HTTP 200と`nickname: null`を返し、保存済みプロフィールのニックネームも消去する。キーが未指定なら現在値を維持する。
+| 項目 | 内容 |
+| --- | --- |
+| 言語と主要ライブラリ | Rust、Axum、Serde、Tokio |
+| 再現境界 | Axum `Router`へ`oneshot`で送る`PATCH /profile` |
+| 入力 | `Content-Type: application/json`と`{"nickname":null}` |
+| 最終観測 | HTTP応答JSONと`AppState`に保存されたプロフィール |
+| 決定性 | インメモリ状態のみを使い、外部ネットワーク・DB・時刻を使わない |
 
-## バグ状態の観測
+## 最初に観測した事実
 
-`71214b8`で次を実行しました。
-
-```bash
-cargo test null_nickname_must_clear_the_persisted_value -- --nocapture
-```
+`71214b8`で`cargo test null_nickname_must_clear_the_persisted_value -- --nocapture`を実行しました。
 
 ```text
 [api] deserialized nickname=None
 [api] persisted nickname=Some("taro")
-nickname:nullは200とnickname=nullを返し、保存済みのnicknameも消去する必要があります:
 status=200 OK, response=Some("taro"), persisted=Some("taro")
 ```
 
-入力は有効なJSONで、応答は200です。しかしレスポンスと保存済み状態がどちらも古い値を維持しています。
+有効なJSONを送ってHTTP 200を受け取りましたが、レスポンスと保存済み状態の両方に古いニックネームが残りました。
 
-GDBで`src/lib.rs:60`の`if let Some(nickname) = request.nickname`に停止すると、ローカル変数は`request = UpdateProfileRequest { nickname: None }`でした。`null`が更新有無を表す外側の値まで失っており、分岐が実行されないことを確認しました。
+## 競合仮説と検証
 
-## 原因
+| 仮説 | 検証 | 結果 |
+| --- | --- | --- |
+| JSONまたはContent-Typeが不正 | 有効JSONと`application/json`を固定する | 200のため除外 |
+| ハンドラーが実行されない | DTOを出力するログを確認する | ログがあるため除外 |
+| nullが未指定と同じDTO値になる | GDBで更新分岐の直前に停止する | 支持 |
+| 保存だけが失敗する | DTO・応答・保存済み状態を別々に確認する | DTOが更新意図を失うため除外 |
 
-更新DTOの`nickname: Option<String>`は、キー未指定とJSON `null`をどちらも`None`として扱います。その後の`if let Some`は文字列だけを更新対象にするため、`null`は未指定と同じく何もしません。Serdeの公式サポート例も、未指定を`None`、存在する`null`を`Some(None)`として区別するために、`Option<Option<T>>`とカスタムデシリアライズを用いています。[1]
+GDBで`src/lib.rs:60`に停止すると、`request = UpdateProfileRequest { nickname: None }`が確認できました。
+
+## 確定した原因
+
+更新DTOの`nickname: Option<String>`では、キー未指定とJSON `null`がどちらも`None`になります。続く`if let Some`は文字列だけを置換対象にするため、`null`は未指定と同じく更新を省略します。Serdeの公式サポート例も、未指定を`None`、存在する`null`を`Some(None)`として扱う方法を示しています。[1]
 
 ## 最小修正
 
-DTOを`Option<Option<String>>`に変更し、`#[serde(default, deserialize_with = "deserialize_present_option")]`で未指定は`None`、存在する値は`Some(...)`にします。ハンドラーは`Some(None)`で消去、`Some(Some(value))`で置換、`None`で維持します。
+DTOを`Option<Option<String>>`へ変更し、`#[serde(default, deserialize_with = "deserialize_present_option")]`で未指定と存在する値を区別しました。ハンドラーは`Some(None)`で消去、`Some(Some(value))`で置換、`None`で維持します。
 
-修正コミット`badad13`後には、次のログを確認しました。
+修正コミット`badad13`では次のログになりました。
 
 ```text
 [api] deserialized nickname=Some(None)
 [api] persisted nickname=None
 ```
 
-## 回帰範囲
+## 回帰保証
 
-| テスト | 確認すること |
+| テスト | 守る契約 |
 | --- | --- |
 | `null_nickname_must_clear_the_persisted_value` | nullで消去する |
 | `omitted_nickname_must_preserve_the_persisted_value` | 未指定で維持する |
 | `string_nickname_must_replace_the_persisted_value` | 文字列で置換する |
 
-`cargo fmt --check`と`cargo test -- --nocapture`は修正済み状態で成功しました。
+修正済み状態で`cargo fmt --check`と`cargo test -- --nocapture`が成功しました。
 
-## 制約
+## 再現手順
 
-このラボは単一フィールドの更新意図を扱います。複数フィールドへ同じ規則を適用する場合は、各フィールドのAPI契約を明確にし、共通DTOまたは専用のトライステート型を検討してください。
+```bash
+# 修正済み状態を検証する
+cargo fmt --check
+cargo test -- --nocapture
+
+# バグ状態を確認する。作業中の変更は先に退避する
+git switch --detach 71214b8
+cargo test null_nickname_must_clear_the_persisted_value -- --nocapture
+git switch main
+```
+
+## スコープと注意点
+
+このラボは単一の任意文字列フィールドを扱います。複数フィールドのPATCH APIでは、未指定・null・空文字列それぞれの契約をフィールドごとに明記してください。入力DTOと永続化モデルを分けると、transport層の三状態を失わずに扱えます。
 
 ## References
 
