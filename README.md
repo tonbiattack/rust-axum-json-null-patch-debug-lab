@@ -12,12 +12,14 @@ AxumとSerdeによるJSON更新APIで、`nickname: null`を「削除」として
 
 `Option<String>`では未指定と`null`がどちらも`None`になり、消去と更新なしを区別できません。修正後は`Option<Option<String>>`とカスタムデシリアライズを用い、未指定を`None`、`null`を`Some(None)`として扱います。[1]
 
-## 実行
+## 最短の開始手順
 
 ```bash
 cargo fmt --check
 cargo test -- --nocapture
 ```
+
+## バグを再現する
 
 バグ状態は`71214b8`です。作業中の変更を退避したうえで、次を実行すると`nickname:null`の契約テストが、200だが保存済み値が残るという理由で失敗します。
 
